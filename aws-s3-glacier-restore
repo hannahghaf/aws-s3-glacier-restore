@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-from __future__ import print_function
 import argparse
 import sys
 import time
 from multiprocessing.dummy import Pool as ThreadPool
-from six.moves import urllib
+import urllib.parse
 import threading
 import re
 
@@ -12,6 +11,9 @@ import boto3
 from botocore.exceptions import ClientError
 
 destination_bucket = None
+s_print_lock = threading.Lock()
+restored_count = None
+not_on_glacier_count = None
 
 
 def s_print(*a, **b):
@@ -86,50 +88,56 @@ def get_matching_s3_keys_and_sizes(s3_url):
 
 
 def restore(to_restore, max_tries=10):
-    if max_tries < 1:
-        s_print("Maximum number of attempts at restoring the object exceeded")
-        return
     global destination_bucket
     key = to_restore['file']['key'].lstrip('/')
     bucket = to_restore['file']['bucket']
-    s_print("Restoring s3://{}/{}".format(bucket, key))
-    try:
-        if destination_bucket is not None:
-            boto3.client('s3') \
-                .restore_object(
-                Bucket=bucket, Key=key,
-                RestoreRequest={'OutputLocation': {
-                    'S3': {
-                        'BucketName': destination_bucket,
-                        'Prefix': key}},
-                    'GlacierJobParameters': {
-                        'Tier': to_restore['tier']}})
 
-        else:
-            boto3.client('s3') \
-                .restore_object(
-                Bucket=bucket, Key=key,
-                RestoreRequest={'Days': to_restore['days'],
-                                'GlacierJobParameters': {
-                                    'Tier': to_restore['tier']}})
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'RestoreAlreadyInProgress':
-            s_print("Restore already in progress")
-        elif e.response['Error']['Code'] == 'InvalidObjectState':
-            s_print("Object's storage class is not GLACIER")
-        elif e.response['Error']['Code'] == \
-                'GlacierExpeditedRetrievalNotAvailable':
-            s_print("Expedited retrieval not available. Sleeping for 1 minute")
-            time.sleep(60)
-            restore(to_restore, max_tries - 1)
-        elif e.response['Error']['Code'] == 'OperationAborted':
-            s_print("Conflicting operation in progress. Retrying in 1 minute")
-            time.sleep(60)
-            restore(to_restore, max_tries - 1)
-        elif e.response['Error']['Code'] == 'NoSuchKey':
-            s_print("Unable to find S3 object key: {}".format(key))
-        else:
-            raise e
+    for attempt in range(max_tries):
+        s_print("Restoring s3://{}/{}".format(bucket, key))
+        try:
+            if destination_bucket is not None:
+                boto3.client('s3') \
+                    .restore_object(
+                    Bucket=bucket, Key=key,
+                    RestoreRequest={'OutputLocation': {
+                        'S3': {
+                            'BucketName': destination_bucket,
+                            'Prefix': key}},
+                        'GlacierJobParameters': {
+                            'Tier': to_restore['tier']}})
+
+            else:
+                if to_restore['days'] is None:
+                    raise ValueError(
+                        "days_to_keep is required when destination_bucket is not set")
+                boto3.client('s3') \
+                    .restore_object(
+                    Bucket=bucket, Key=key,
+                    RestoreRequest={'Days': to_restore['days'],
+                                    'GlacierJobParameters': {
+                                        'Tier': to_restore['tier']}})
+            return
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'RestoreAlreadyInProgress':
+                s_print("Restore already in progress")
+                return
+            elif error_code == 'InvalidObjectState':
+                s_print("Object's storage class is not GLACIER")
+                return
+            elif error_code == 'GlacierExpeditedRetrievalNotAvailable':
+                s_print("Expedited retrieval not available. Sleeping for 1 minute")
+                time.sleep(60)
+            elif error_code == 'OperationAborted':
+                s_print("Conflicting operation in progress. Retrying in 1 minute")
+                time.sleep(60)
+            elif error_code == 'NoSuchKey':
+                s_print("Unable to find S3 object key: {}".format(key))
+                return
+            else:
+                raise e
+
+    s_print("Maximum number of attempts at restoring the object exceeded")
 
 
 def check_status(to_check):
@@ -138,10 +146,10 @@ def check_status(to_check):
     bucket = to_check['file']['bucket']
     response = boto3.client('s3').head_object(Bucket=bucket, Key=key)
     path = "s3://" + bucket + "/" + key
-    if 'StorageClass' not in response \
-            or response['StorageClass'] not in ["GLACIER", "DEEP_ARCHIVE"]:
-        s_print("Object {} storageClass is not Glacier or Glacier Deep Archvie:"
-                " {}".format(path, response['StorageClass']))
+    storage_class = response.get('StorageClass', 'STANDARD')
+    if storage_class not in ["GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING"]:
+        s_print("Object {} storageClass is not Glacier or Glacier Deep Archive:"
+                " {}".format(path, storage_class))
         not_on_glacier_count.inc()
     else:
         if 'Restore' in response:
@@ -167,6 +175,12 @@ def restore_main(
         status_check,
         missing,
         tier_nr):
+    global restored_count, not_on_glacier_count
+
+    if restored_count is None:
+        restored_count = AtomicInteger()
+    if not_on_glacier_count is None:
+        not_on_glacier_count = AtomicInteger()
 
     pool = ThreadPool(number_of_threads)
 
@@ -203,7 +217,7 @@ def restore_main(
                     "Glacier. For them restore isn't needed"
                     .format(not_on_glacier_count.value()))
         if missing:
-            to_restore = list(filter(lambda x: x != None, not_restored))
+            to_restore = list(filter(lambda x: x is not None, not_restored))
         else:
             return
 
@@ -262,8 +276,6 @@ def restore_main(
 
 
 if __name__ == '__main__':
-    s_print_lock = threading.Lock()
-
     parser = argparse.ArgumentParser(
         description='Utility script to restore files on AWS S3 that have '
                     'GLACIER storage class')
@@ -293,13 +305,12 @@ if __name__ == '__main__':
              'files. Once you don\'t need them you can delete them from '
              'destination bucket.'
     )
-    # 40 threads from Mac (home network) results in 2K files restored per minute
     parser.add_argument(
         '-t',
         '--threads',
-        help='Number of threads to use. Default=40',
+        help='Number of threads to use. Default=1',
         type=int,
-        default=40)
+        default=1)
     # Added an option to add a tier number to the command line. Skips prompt
     parser.add_argument(
         '-n',
@@ -324,8 +335,8 @@ if __name__ == '__main__':
     )
 
     args = vars(parser.parse_args())
-    restored_count = AtomicInteger()
-    not_on_glacier_count = AtomicInteger()
+    restored_count = AtomicInteger()  # noqa: F841 - used as module global
+    not_on_glacier_count = AtomicInteger()  # noqa: F841 - used as module global
 
     if args['input_file'] is None and args['prefix'] is None:
         raise Exception("Must either specify input_file or prefix")
