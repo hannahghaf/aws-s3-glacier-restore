@@ -110,11 +110,10 @@ Object s3://test-restore-bucket/archives/cars/GlacierImageArchive_2017_10-000000
 Object s3://test-restore-bucket/archives/cars/GlacierImageArchive_2017_10-00000001-r-00099 storage class INTELLIGENT_TIERING does not require restore
 Object s3://test-restore-bucket/archives/cars/GlacierImageArchive_2017_10-00000001-r-00097 is in Glacier and not being restored
 Status summary:
-    1 already accessible, no restore needed
-    3 restored and ready
-    1 restoring now
-    5 not started
-
+  1 already accessible, no restore needed
+  3 restored and ready
+  1 restoring now
+  5 not started
 Accessible now: 4/10
 ```
 ### License

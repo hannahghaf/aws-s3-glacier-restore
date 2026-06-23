@@ -242,12 +242,11 @@ def restore_main(
         not_started = len([x for x in not_restored if x is not None])
         accessible = restored_count.value() + not_on_glacier_count.value()
         s_print("Status summary:")
-        s_print("    {} already accessible, no restore needed".format(
+        s_print("  {} already accessible, no restore needed".format(
             not_on_glacier_count.value()))
-        s_print("    {} restored and ready".format(restored_count.value()))
-        s_print("    {} restoring now".format(in_progress_count.value()))
-        s_print("    {} not started".format(not_started))
-        s_print("")
+        s_print("  {} restored and ready".format(restored_count.value()))
+        s_print("  {} restoring now".format(in_progress_count.value()))
+        s_print("  {} not started".format(not_started))
         s_print("Accessible now: {}/{}".format(accessible, len(to_restore)))
         if missing:
             to_restore = list(filter(lambda x: x is not None, not_restored))
